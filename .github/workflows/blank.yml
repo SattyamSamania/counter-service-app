@@ -1,4 +1,4 @@
-name: Build and Push Docker image to AWS ECR
+name: Build and Push Docker image to AWS ECR 
 
 # Trigger this workflow when code is pushed to the "development" branch
 on:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest   # Use Ubuntu runner
+    runs-on: ubuntu-latest
 
     steps:
     # Step 1: Checkout the repository
