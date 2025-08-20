@@ -1,0 +1,13 @@
+version: '2.4'  # Supports mem_limit and cpus
+
+services:
+  counter-service:
+    container_name: counter-service-app
+    image: 651360294785.dkr.ecr.ap-south-1.amazonaws.com/counter-service-app:latest
+    volumes:
+      - ./data:/app/data     # Mount local ./data → container /app/data
+    ports:
+      - "80:8081"            # Map host port 80 → container port 8081
+    restart: always
+    mem_limit: 256M          # Limit memory usage
+    cpus: 0.5                # Limit CPU usage to half a core
