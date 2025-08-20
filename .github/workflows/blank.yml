@@ -1,0 +1,115 @@
+name: Build and Push Docker image to AWS ECR 
+
+# Trigger this workflow when code is pushed to the "development" branch
+on:
+  push:
+    branches:
+      - development
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Step 1: Checkout the repository
+    - name: Check out the repo
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0 # Fetch all history and tags (needed for versioning)
+
+    ################################################################
+    ###               DETERMINE NEXT VERSION                     ###
+    ###   Used for creating new releases and image tags          ###
+    ################################################################
+
+    - name: Determine Next Version
+      id: next_version
+      run: |
+        # Fetch all Git tags (versions)
+        git fetch --tags
+        
+        # Get the latest version tag (in format vX.Y.Z)
+        LATEST_TAG=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+        
+        # If no tags exist yet, start from v0.0.0
+        if [ -z "$LATEST_TAG" ]; then
+          LATEST_TAG="v0.0.0"
+        fi
+        
+        # Increment PATCH version by +1 (vX.Y.Z → vX.Y.(Z+1))
+        NEXT_TAG=$(echo $LATEST_TAG | awk -F. '{print $1"."$2"."$3+1}')
+        
+        # Save the next version in GitHub Actions outputs
+        echo "tag=$NEXT_TAG" >> $GITHUB_OUTPUT
+        echo "Next version: $NEXT_TAG"
+
+    ################################################################
+    ###                     CREATE RELEASE                       ###
+    ###  Creates a GitHub Release with the new version tag       ###
+    ################################################################
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        # GitHub automatically provides this token for authentication
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.next_version.outputs.tag }}
+        release_name: Release ${{ steps.next_version.outputs.tag }}
+        draft: false
+        prerelease: false
+
+    ################################################################
+    ###                  AWS CONFIGURATION                       ###
+    ###   Authenticate with AWS using stored GitHub secrets      ###
+    ################################################################
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1   
+
+    # Step: Authenticate Docker client to Amazon ECR
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    ################################################################
+    ###                  BUILD DOCKER IMAGE                      ###
+    ###   Build and tag Docker image with next version           ###
+    ################################################################
+
+    - name: Build Docker image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}   # e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com
+        ECR_REPOSITORY: counter-service-app   # ECR repo name (must exist in AWS)
+        IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
+      run: |
+        # Build Docker image and tag with version
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        
+        # Save image name for later steps
+        echo "IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+    ################################################################
+    ###                  PUSH IMAGE TO ECR                       ###
+    ###   Push version tag and "latest" tag to AWS ECR           ###
+    ################################################################
+
+    - name: Push Docker image to Amazon ECR
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: counter-service-app   # Same repo name as above
+        IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
+      run: |
+        # Tag image also as "latest" for easy pulls
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        # Push versioned image
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Push "latest" image
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
