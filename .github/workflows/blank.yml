@@ -19,6 +19,24 @@ jobs:
         fetch-depth: 0 # Necessary to fetch all tags and history
 
 ################################################################
+###               SONAR CLOUD SCAN                           ###
+### Drops the build if any bugs or vulnerabilities are found.###
+###            Using the default quality gate.               ###
+###        Connected to my personal Sonar Cloud account      ###
+################################################################
+
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarqube-scan-action@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    - name: Setup Git
+      run: |
+        git config --global user.name 'github-actions'
+        git config --global user.email 'github-actions@github.com'
+
+################################################################
 ###               DETERMINE NEXT VERSION                     ###
 ###   Used for creating new releases and image tags          ###
 ################################################################
@@ -41,8 +59,9 @@ jobs:
         NEXT_TAG=$(echo $LATEST_TAG | awk -F. '{print $1"."$2"."$3+1}')
         
         # Output the next version
-        echo "tag=$NEXT_TAG" >> $GITHUB_OUTPUT
+        echo "::set-output name=tag::$NEXT_TAG"
         echo "Next version: $NEXT_TAG"
+
 ################################################################
 ###                     CREATE RELEASE                       ###
 ###  Creating release with the tag from the previous step    ###
@@ -52,7 +71,7 @@ jobs:
       id: create_release
       uses: actions/create-release@v1
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # ✅ using built-in token now
+        GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN_2 }}
       with:
         tag_name: ${{ steps.next_version.outputs.tag }}
         release_name: Release ${{ steps.next_version.outputs.tag }}
@@ -80,18 +99,37 @@ jobs:
       run: |
         REPO_NAME="${GITHUB_REPOSITORY##*/}"
         echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
-        echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+        echo "::set-output name=repo_name::$REPO_NAME"
+
     - name: Build Docker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: counter-service-app
+        ECR_REPOSITORY: ${{ env.REPO_NAME }}
         IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         echo "IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
 ###########################################################
-###                  PUSH IMAGE TO ECR                  ###
+###  Docker image Snyk scan | If fails, drop the action ###
+###       Connected to my personal Snyk account         ###
+###     The code owner receives an email notification   ###
+### Possible to configure Slack notification if needed  ###
+###########################################################               
+
+    - name: Run Snyk to check Docker image for vulnerabilities
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+         image: ${{ env.IMAGE_NAME }}
+         args: --severity-threshold=high --policy-path=.snyk
+      continue-on-error: false
+
+###########################################################
+###         PUSH IMAGE TO ECR AND DEPLOY TO EC2         ###
 ###     Tag Docker image as "latest" and push to ECR    ###
+###               Deploy to EC2 using SSH               ###
 ########################################################### 
 
     - name: Push Docker image to Amazon ECR
@@ -100,9 +138,27 @@ jobs:
         ECR_REPOSITORY: counter-service-app
         IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
       run: |
-        # Tag the image as latest
         docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-        # Push the specific version tag
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        # Push the latest tag
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+    - name: Deploy to EC2
+      env:
+        EC2_PEM_KEY: ${{ secrets.EC2_PEM_KEY }}
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USER: ${{ secrets.EC2_USER }}
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: counter-service-app
+        IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
+      run: |
+        echo "$EC2_PEM_KEY" > ec2.pem
+        chmod 400 ec2.pem
+
+        SSH_COMMAND="ssh -i ec2.pem -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST"
+        SCP_COMMAND="scp -i ec2.pem -o StrictHostKeyChecking=no"
+
+        $SSH_COMMAND "aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin $ECR_REGISTRY"
+        $SCP_COMMAND docker-compose.yml $EC2_USER@$EC2_HOST:/home/ubuntu/docker/
+        $SSH_COMMAND "cd /home/ubuntu/docker/ && docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG && docker compose -f docker-compose.yml up -d --force-recreate"
+        
+        rm -f ec2.pem
